@@ -219,6 +219,10 @@ Once the dependencies are installed, clone this repo and run
 ARCH targets, edit the `targets` array in the `build_release.py` file
 before running it.
 
+Release tags also publish an OCI container image to
+`ghcr.io/<owner>/apc-p15-tool`. The image runs `apc-p15-tool` by default, and
+the install-only binary is available as `apc-p15-install`.
+
 ## Links
 
 @Owl-Tec's write up using this tool with ACDS: 

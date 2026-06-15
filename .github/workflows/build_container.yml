@@ -1,0 +1,172 @@
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
+name: Build and Push Container
+
+on:
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: "Git ref/SHA to build. Defaults to the workflow SHA."
+        required: false
+        type: string
+      image_tag:
+        description: "Optional raw container tag, for example v1.3.5."
+        required: false
+        type: string
+      version:
+        description: "Optional version to bake into the image metadata."
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run tests
+        run: go test ./...
+
+  release_package:
+    name: Build and Push Container
+    runs-on: ubuntu-24.04
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_digest: ${{ steps.image-reference.outputs.image_digest }}
+      image_name: ${{ steps.image-reference.outputs.image_name }}
+      image_ref: ${{ steps.image-reference.outputs.image_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve container tag rules
+        id: tag-rules
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          {
+            echo "rules<<EOF"
+
+            if [[ -n "${INPUT_IMAGE_TAG}" ]]; then
+              echo "type=raw,value=${INPUT_IMAGE_TAG}"
+
+              if [[ "${INPUT_IMAGE_TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "type=raw,value=latest"
+              fi
+            else
+              echo "type=ref,event=branch"
+              echo "type=ref,event=tag"
+              echo "type=semver,pattern={{version}}"
+
+              if [[ "${GITHUB_REF_NAME}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "type=raw,value=latest"
+              fi
+            fi
+
+            echo "type=sha"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+          tags: ${{ steps.tag-rules.outputs.rules }}
+          labels: |
+            org.opencontainers.image.description=Create and install SSL certificates for APC Network Management Cards
+          annotations: |
+            org.opencontainers.image.description=Create and install SSL certificates for APC Network Management Cards
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+
+      - name: Resolve build metadata
+        id: build-metadata
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          META_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          version="${INPUT_VERSION:-${META_VERSION}}"
+          if [[ -z "${version}" ]]; then
+            version="unknown"
+          fi
+
+          {
+            echo "version=${version}"
+            echo "vcs_ref=$(git rev-parse HEAD)"
+            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            BUILD_DATE=${{ steps.build-metadata.outputs.build_date }}
+            VCS_REF=${{ steps.build-metadata.outputs.vcs_ref }}
+            VERSION=${{ steps.build-metadata.outputs.version }}
+
+      - name: Resolve published image reference
+        id: image-reference
+        env:
+          IMAGE_DIGEST: ${{ steps.build-push.outputs.digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ inputs.image_tag || steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          image_ref=""
+          if [[ -n "${IMAGE_TAG}" && -n "${IMAGE_DIGEST}" ]]; then
+            image_ref="${IMAGE_NAME}:${IMAGE_TAG}@${IMAGE_DIGEST}"
+          fi
+
+          {
+            echo "image_digest=${IMAGE_DIGEST}"
+            echo "image_name=${IMAGE_NAME}"
+            echo "image_ref=${image_ref}"
+          } >> "${GITHUB_OUTPUT}"
